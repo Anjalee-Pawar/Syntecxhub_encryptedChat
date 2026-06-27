@@ -1,0 +1,42 @@
+"""
+logger.py
+=========
+Thread-safe message logger.
+Writes timestamped entries to both stdout and a log file under ./logs/.
+"""
+
+import os
+import threading
+import datetime
+
+LOG_DIR  = os.path.join(os.path.dirname(__file__), "logs")
+LOG_FILE = os.path.join(LOG_DIR, "chat.log")
+
+_lock = threading.Lock()
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(tag: str, message: str, print_to_stdout: bool = True) -> None:
+    """Write a log entry. Thread-safe."""
+    entry = f"[{_now()}] [{tag}] {message}"
+    with _lock:
+        if print_to_stdout:
+            print(entry)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+
+
+def log_raw(tag: str, sender: str, encrypted: str, decrypted: str) -> None:
+    """Log both the encrypted and decrypted form of a message (server side)."""
+    with _lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(
+                f"[{_now()}] [{tag}] FROM={sender}\n"
+                f"  ENCRYPTED : {encrypted}\n"
+                f"  DECRYPTED : {decrypted}\n"
+            )
