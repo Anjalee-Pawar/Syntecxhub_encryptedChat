@@ -1,4 +1,10 @@
 
+
+
+Encrypted Chat App
+A client/server TCP chat application with AES-256-CBC and 3DES-CBC symmetric encryption.
+Messages are encrypted on the client, transmitted over the socket, and decrypted on the server (and re-encrypted per recipient). All sessions are logged.
+
 encrypted-chat/
 ├── crypto/
 │   ├── __init__.py
