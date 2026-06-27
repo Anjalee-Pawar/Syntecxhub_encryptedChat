@@ -1,0 +1,64 @@
+"""
+protocol.py
+===========
+Defines the text-based line protocol used over the TCP socket.
+
+Every message is a single UTF-8 line terminated with '\\n'.
+Format:
+    TYPE|PAYLOAD
+
+Types
+-----
+HELLO   client → server    "HELLO|<nickname>|<cipher_mode>"
+                           cipher_mode = AES or DES
+ACK     server → client    "ACK|<nickname>|<cipher_mode>"
+MSG     bidirectional      "MSG|<sender>|<encrypted_payload>"
+SYS     server → client    "SYS|<plaintext_system_notice>"
+BYE     client → server    "BYE|<nickname>"
+"""
+
+SEP = "|"
+
+
+def encode_hello(nickname: str, cipher_mode: str) -> str:
+    return f"HELLO{SEP}{nickname}{SEP}{cipher_mode}\n"
+
+
+def encode_ack(nickname: str, cipher_mode: str) -> str:
+    return f"ACK{SEP}{nickname}{SEP}{cipher_mode}\n"
+
+
+def encode_msg(sender: str, encrypted: str) -> str:
+    return f"MSG{SEP}{sender}{SEP}{encrypted}\n"
+
+
+def encode_sys(text: str) -> str:
+    return f"SYS{SEP}{text}\n"
+
+
+def encode_bye(nickname: str) -> str:
+    return f"BYE{SEP}{nickname}\n"
+
+
+def decode(line: str) -> dict:
+    """Parse a raw protocol line into a dict with 'type' and fields."""
+    line  = line.strip()
+    parts = line.split(SEP, 2)
+    kind  = parts[0]
+
+    if kind == "HELLO" and len(parts) == 3:
+        return {"type": "HELLO", "nickname": parts[1], "cipher": parts[2]}
+
+    if kind == "ACK" and len(parts) == 3:
+        return {"type": "ACK", "nickname": parts[1], "cipher": parts[2]}
+
+    if kind == "MSG" and len(parts) == 3:
+        return {"type": "MSG", "sender": parts[1], "payload": parts[2]}
+
+    if kind == "SYS" and len(parts) >= 2:
+        return {"type": "SYS", "text": parts[1] if len(parts) > 1 else ""}
+
+    if kind == "BYE" and len(parts) >= 2:
+        return {"type": "BYE", "nickname": parts[1]}
+
+    return {"type": "UNKNOWN", "raw": line}
