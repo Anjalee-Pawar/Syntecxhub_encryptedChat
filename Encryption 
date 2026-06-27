@@ -1,0 +1,163 @@
+"""
+encryption.py
+=============
+Provides AES-256-CBC and 3DES-CBC symmetric encryption/decryption.
+
+Design decisions
+----------------
+* AES-256 CBC  — 256-bit key, 16-byte IV, PKCS7 padding
+* 3DES (Triple-DES) CBC — 24-byte key, 8-byte IV, PKCS7 padding
+* A fresh random IV is generated for EVERY message and prepended to the
+  ciphertext, so the receiver can always extract it (safe IV usage).
+* Keys are derived from a human-readable passphrase via PBKDF2-HMAC-SHA256
+  with a fixed salt (for a demo pre-shared-key setup). In production you
+  would exchange salt and iteration count over a secure channel or use ECDH.
+
+Wire format (bytes)
+-------------------
+  [ IV bytes ][ ciphertext bytes ]
+The whole thing is then base64-encoded for safe transport over the text
+socket protocol.
+"""
+
+import os
+import base64
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as sym_padding, hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+
+# ── constants ────────────────────────────────────────────────────────────────
+AES_KEY_SIZE   = 32          # 256-bit
+AES_BLOCK_SIZE = 128         # bits (16 bytes)
+AES_IV_SIZE    = 16          # bytes
+
+DES3_KEY_SIZE  = 24          # 192-bit (3 × 64-bit DES)
+DES3_IV_SIZE   = 8           # bytes (DES block = 64 bits)
+
+KDF_SALT       = b"EncryptedChatApp_SALT_2024"   # fixed demo salt
+KDF_ITERATIONS = 200_000
+
+# ── key derivation ────────────────────────────────────────────────────────────
+
+def derive_key(passphrase: str, key_size: int) -> bytes:
+    """Derive a symmetric key from a passphrase using PBKDF2-HMAC-SHA256."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=key_size,
+        salt=KDF_SALT,
+        iterations=KDF_ITERATIONS,
+        backend=default_backend(),
+    )
+    return kdf.derive(passphrase.encode())
+
+
+# ── padding helpers ───────────────────────────────────────────────────────────
+
+def _pad(data: bytes, block_bits: int) -> bytes:
+    padder = sym_padding.PKCS7(block_bits).padder()
+    return padder.update(data) + padder.finalize()
+
+
+def _unpad(data: bytes, block_bits: int) -> bytes:
+    unpadder = sym_padding.PKCS7(block_bits).unpadder()
+    return unpadder.update(data) + unpadder.finalize()
+
+
+# ── AES-256-CBC ───────────────────────────────────────────────────────────────
+
+class AESCipher:
+    """AES-256-CBC symmetric cipher."""
+
+    def __init__(self, passphrase: str):
+        self.key = derive_key(passphrase, AES_KEY_SIZE)
+
+    def encrypt(self, plaintext: str) -> str:
+        """Encrypt *plaintext* and return a base64 string (IV + ciphertext)."""
+        iv   = os.urandom(AES_IV_SIZE)
+        data = _pad(plaintext.encode(), AES_BLOCK_SIZE)
+
+        cipher = Cipher(
+            algorithms.AES(self.key),
+            modes.CBC(iv),
+            backend=default_backend(),
+        )
+        ct = cipher.encryptor().update(data) + cipher.encryptor().finalize()
+
+        # re-create encryptor (finalize closes it)
+        enc = Cipher(
+            algorithms.AES(self.key),
+            modes.CBC(iv),
+            backend=default_backend(),
+        ).encryptor()
+        ct = enc.update(data) + enc.finalize()
+
+        return base64.b64encode(iv + ct).decode()
+
+    def decrypt(self, token: str) -> str:
+        """Decrypt a base64 token produced by :meth:`encrypt`."""
+        raw = base64.b64decode(token.encode())
+        iv, ct = raw[:AES_IV_SIZE], raw[AES_IV_SIZE:]
+
+        dec = Cipher(
+            algorithms.AES(self.key),
+            modes.CBC(iv),
+            backend=default_backend(),
+        ).decryptor()
+        padded = dec.update(ct) + dec.finalize()
+        return _unpad(padded, AES_BLOCK_SIZE).decode()
+
+
+# ── 3DES-CBC ──────────────────────────────────────────────────────────────────
+
+class DESCipher:
+    """
+    Triple-DES (3DES) CBC symmetric cipher.
+
+    NOTE: 3DES is legacy / deprecated in modern standards (NIST retired it
+    in 2023). It is included here for educational comparison with AES.
+    Do NOT use 3DES in new production systems.
+    """
+
+    def __init__(self, passphrase: str):
+        self.key = derive_key(passphrase, DES3_KEY_SIZE)
+
+    def _make_cipher(self, iv: bytes):
+        try:
+            # cryptography >= 42 moved 3DES to the "decrepit" namespace
+            from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
+        except ImportError:
+            from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES  # type: ignore
+
+        return Cipher(
+            TripleDES(self.key),
+            modes.CBC(iv),
+            backend=default_backend(),
+        )
+
+    def encrypt(self, plaintext: str) -> str:
+        iv   = os.urandom(DES3_IV_SIZE)
+        data = _pad(plaintext.encode(), 64)   # DES block = 64 bits
+        enc  = self._make_cipher(iv).encryptor()
+        ct   = enc.update(data) + enc.finalize()
+        return base64.b64encode(iv + ct).decode()
+
+    def decrypt(self, token: str) -> str:
+        raw = base64.b64decode(token.encode())
+        iv, ct = raw[:DES3_IV_SIZE], raw[DES3_IV_SIZE:]
+        dec = self._make_cipher(iv).decryptor()
+        padded = dec.update(ct) + dec.finalize()
+        return _unpad(padded, 64).decode()
+
+
+# ── factory ───────────────────────────────────────────────────────────────────
+
+def get_cipher(mode: str, passphrase: str):
+    """Return AESCipher or DESCipher based on *mode* ('AES' or 'DES')."""
+    mode = mode.upper()
+    if mode == "AES":
+        return AESCipher(passphrase)
+    elif mode in ("DES", "3DES"):
+        return DESCipher(passphrase)
+    raise ValueError(f"Unknown cipher mode: {mode!r}. Choose 'AES' or 'DES'.")
