@@ -1,0 +1,178 @@
+"""
+client.py
+=========
+Interactive terminal chat client.
+
+Usage
+-----
+    python client.py [--host 127.0.0.1] [--port 9000]
+                     [--nick Alice] [--cipher AES|DES]
+                     [--passphrase "your passphrase"]
+
+Flow
+----
+1. Connect to server via TCP.
+2. Send HELLO handshake (nickname + cipher choice).
+3. Wait for ACK from server.
+4. Spawn a receiver thread that prints incoming messages in real time.
+5. Main thread reads user input, encrypts each line, sends MSG to server.
+6. Type  /quit  to disconnect gracefully.
+"""
+
+import socket
+import threading
+import argparse
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from crypto.encryption import get_cipher
+from protocol import decode, encode_hello, encode_msg, encode_bye
+
+# ── defaults ─────────────────────────────────────────────────────────────────
+DEFAULT_HOST       = "127.0.0.1"
+DEFAULT_PORT       = 9000
+DEFAULT_PASSPHRASE = "SuperSecretPassphrase!2024"   # must match server
+
+
+# ── receiver thread ───────────────────────────────────────────────────────────
+
+def receiver(sock: socket.socket, cipher_obj, nickname: str, stop_event: threading.Event):
+    """Background thread: print incoming messages as they arrive."""
+    buf = ""
+    try:
+        while not stop_event.is_set():
+            data = sock.recv(4096)
+            if not data:
+                break
+            buf += data.decode(errors="replace")
+
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                parsed = decode(line)
+
+                if parsed["type"] == "MSG":
+                    sender    = parsed["sender"]
+                    encrypted = parsed["payload"]
+                    try:
+                        plaintext = cipher_obj.decrypt(encrypted)
+                    except Exception as exc:
+                        plaintext = f"[DECRYPT ERROR: {exc}]"
+                    # Clear current input line, print message, reprint prompt
+                    sys.stdout.write(f"\r\033[K[{sender}]: {plaintext}\n> ")
+                    sys.stdout.flush()
+
+                elif parsed["type"] == "SYS":
+                    sys.stdout.write(f"\r\033[K*** {parsed['text']} ***\n> ")
+                    sys.stdout.flush()
+
+                elif parsed["type"] == "ACK":
+                    pass  # already handled in main
+
+    except OSError:
+        pass
+    finally:
+        stop_event.set()
+        print("\n[Client] Disconnected from server.")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Encrypted Chat Client")
+    parser.add_argument("--host",       default=DEFAULT_HOST)
+    parser.add_argument("--port",       type=int, default=DEFAULT_PORT)
+    parser.add_argument("--nick",       default=None,   help="Your display name")
+    parser.add_argument("--cipher",     default="AES",  choices=["AES", "DES"],
+                        help="Encryption cipher (default: AES)")
+    parser.add_argument("--passphrase", default=DEFAULT_PASSPHRASE,
+                        help="Pre-shared passphrase (must match server)")
+    args = parser.parse_args()
+
+    # ── resolve nickname ──────────────────────────────────────────────────────
+    nickname = args.nick
+    if not nickname:
+        nickname = input("Enter your nickname: ").strip() or "Anonymous"
+
+    cipher_mode = args.cipher.upper()
+
+    print(f"[Client] Cipher: {cipher_mode}")
+    print(f"[Client] Connecting to {args.host}:{args.port} as '{nickname}'...")
+
+    # ── build cipher ──────────────────────────────────────────────────────────
+    try:
+        cipher_obj = get_cipher(cipher_mode, args.passphrase)
+    except ValueError as exc:
+        print(f"[Client] Bad cipher: {exc}")
+        sys.exit(1)
+
+    # ── connect ───────────────────────────────────────────────────────────────
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((args.host, args.port))
+    except ConnectionRefusedError:
+        print("[Client] Could not connect — is the server running?")
+        sys.exit(1)
+
+    # ── HELLO handshake ───────────────────────────────────────────────────────
+    sock.sendall(encode_hello(nickname, cipher_mode).encode())
+
+    # wait for ACK
+    raw = sock.recv(256).decode(errors="replace")
+    msg = decode(raw.strip())
+    if msg["type"] != "ACK":
+        print(f"[Client] Unexpected server response: {raw!r}")
+        sock.close()
+        sys.exit(1)
+
+    print(f"[Client] Connected! Cipher={msg['cipher']}. Type /quit to exit.\n")
+
+    # ── start receiver thread ─────────────────────────────────────────────────
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=receiver,
+        args=(sock, cipher_obj, nickname, stop_event),
+        daemon=True,
+    )
+    t.start()
+
+    # ── send loop (main thread) ───────────────────────────────────────────────
+    try:
+        while not stop_event.is_set():
+            try:
+                text = input("> ").strip()
+            except EOFError:
+                break
+
+            if not text:
+                continue
+
+            if text.lower() == "/quit":
+                sock.sendall(encode_bye(nickname).encode())
+                break
+
+            # encrypt and send
+            try:
+                encrypted = cipher_obj.encrypt(text)
+                sock.sendall(encode_msg(nickname, encrypted).encode())
+            except Exception as exc:
+                print(f"[Client] Encrypt error: {exc}")
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        print("[Client] Goodbye.")
+
+
+if __name__ == "__main__":
+    main()
