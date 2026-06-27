@@ -1,0 +1,165 @@
+"""
+demo.py
+=======
+Automated demo: spins up the server in-process, connects two simulated
+clients (Alice using AES, Bob using 3DES), exchanges messages, then shuts
+everything down.  No terminals needed.
+
+Run:  python demo.py
+"""
+
+import sys, os, socket, threading, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from crypto.encryption import get_cipher
+from protocol import decode, encode_hello, encode_msg, encode_bye
+
+# ── import server machinery ───────────────────────────────────────────────────
+# Patch server defaults so the demo uses a different port
+import server.server as _srv
+_srv.DEFAULT_PORT = 19001
+
+from server.server import handle_client
+
+PASSPHRASE = "SuperSecretPassphrase!2024"
+HOST, PORT = "127.0.0.1", 19001
+
+
+# ── start server in background ────────────────────────────────────────────────
+def run_server(ready_event):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(10)
+    srv.settimeout(8)
+    ready_event.set()
+    try:
+        while True:
+            try:
+                cli, addr = srv.accept()
+                threading.Thread(target=handle_client, args=(cli, addr), daemon=True).start()
+            except socket.timeout:
+                break
+    finally:
+        srv.close()
+
+
+# ── simulated client ──────────────────────────────────────────────────────────
+class SimClient:
+    def __init__(self, nick, cipher_mode):
+        self.nick       = nick
+        self.cipher     = get_cipher(cipher_mode, PASSPHRASE)
+        self.mode       = cipher_mode
+        self.received   = []
+        self.sock       = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._stop      = threading.Event()
+
+    def connect(self):
+        self.sock.connect((HOST, PORT))
+        self.sock.sendall(encode_hello(self.nick, self.mode).encode())
+        ack = self.sock.recv(256).decode()
+        assert decode(ack.strip())["type"] == "ACK", f"No ACK: {ack!r}"
+        t = threading.Thread(target=self._recv_loop, daemon=True)
+        t.start()
+        print(f"  ✓ {self.nick} connected ({self.mode})")
+
+    def _recv_loop(self):
+        buf = ""
+        while not self._stop.is_set():
+            try:
+                self.sock.settimeout(0.5)
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+                buf += data.decode(errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    msg = decode(line.strip())
+                    if msg["type"] == "MSG":
+                        try:
+                            pt = self.cipher.decrypt(msg["payload"])
+                        except Exception:
+                            pt = "[DECRYPT ERR]"
+                        self.received.append((msg["sender"], pt))
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    def send(self, text):
+        ct = self.cipher.encrypt(text)
+        self.sock.sendall(encode_msg(self.nick, ct).encode())
+        print(f"  → {self.nick} sent (encrypted): {ct[:40]}...")
+
+    def disconnect(self):
+        self._stop.set()
+        self.sock.sendall(encode_bye(self.nick).encode())
+        self.sock.close()
+
+
+# ── demo ──────────────────────────────────────────────────────────────────────
+def main():
+    print("=" * 62)
+    print("  Encrypted Chat — Automated Demo")
+    print("=" * 62)
+
+    # start server
+    ready = threading.Event()
+    threading.Thread(target=run_server, args=(ready,), daemon=True).start()
+    ready.wait(timeout=3)
+    print(f"\n[Server] Listening on {HOST}:{PORT}\n")
+
+    # connect clients
+    alice = SimClient("Alice", "AES")
+    bob   = SimClient("Bob",   "DES")
+    alice.connect()
+    bob.connect()
+    time.sleep(0.3)
+
+    # exchange messages
+    print("\n── Message exchange ─────────────────────────────────────")
+    messages = [
+        (alice, "Hey Bob! This message is encrypted with AES-256-CBC."),
+        (bob,   "Hi Alice! I'm using 3DES-CBC — different cipher, same passphrase!"),
+        (alice, "The server decrypts, logs, then re-encrypts for each recipient."),
+        (bob,   "Every message gets a fresh random IV — no IV reuse! 🔐"),
+    ]
+
+    for client, text in messages:
+        client.send(text)
+        time.sleep(0.4)
+
+    time.sleep(0.5)
+
+    # show what each client received
+    print("\n── Received messages ────────────────────────────────────")
+    print(f"\n  Alice received ({len(alice.received)} messages):")
+    for sender, text in alice.received:
+        print(f"    [{sender}]: {text}")
+
+    print(f"\n  Bob received ({len(bob.received)} messages):")
+    for sender, text in bob.received:
+        print(f"    [{sender}]: {text}")
+
+    # verify
+    print("\n── Verification ─────────────────────────────────────────")
+    alice_got_bobs   = any("3DES" in t for _, t in alice.received)
+    bob_got_alices   = any("AES" in t for _, t in bob.received)
+    print(f"  ✓ Alice received Bob's 3DES message:   {alice_got_bobs}")
+    print(f"  ✓ Bob received Alice's AES message:    {bob_got_alices}")
+    print(f"  ✓ Log file written:                    {os.path.exists('logs/chat.log')}")
+
+    # disconnect
+    alice.disconnect()
+    bob.disconnect()
+    time.sleep(0.3)
+
+    print("\n  Demo complete ✅")
+    print("=" * 62)
+    print(f"  Check logs/chat.log for the full encrypted + plaintext log.")
+    print("=" * 62)
+
+
+if __name__ == "__main__":
+    main()
