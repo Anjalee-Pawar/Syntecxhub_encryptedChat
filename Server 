@@ -1,0 +1,227 @@
+"""
+server.py
+=========
+Multi-client encrypted TCP chat server.
+
+How it works
+------------
+1. Server starts on HOST:PORT and listens for connections.
+2. Each connecting client sends a HELLO handshake containing:
+       - nickname
+       - cipher mode (AES or DES)
+   The server replies with ACK and records the client's cipher preference.
+
+3. Every client thread runs independently (threading.Thread).
+   When a MSG arrives:
+       a. Server decrypts it using the client's cipher + the shared passphrase.
+       b. Logs both encrypted and plaintext form to logs/chat.log.
+       c. Re-encrypts the message using EACH recipient's own cipher.
+       d. Broadcasts the re-encrypted message to all other connected clients.
+
+Key & passphrase
+----------------
+The pre-shared passphrase is defined in SHARED_PASSPHRASE below.
+Both server and all clients must use the same value.
+In a real system this would be exchanged via a secure key-agreement protocol
+(e.g. Diffie-Hellman / ECDH). Here we keep it simple.
+
+Usage
+-----
+    python server.py [--host 0.0.0.0] [--port 9000]
+"""
+
+import socket
+import threading
+import argparse
+import sys
+import os
+
+# allow imports from project root
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from crypto.encryption import get_cipher
+from protocol import decode, encode_ack, encode_msg, encode_sys, encode_bye
+from logger import log, log_raw
+
+# ── configuration ─────────────────────────────────────────────────────────────
+DEFAULT_HOST       = "127.0.0.1"
+DEFAULT_PORT       = 9000
+SHARED_PASSPHRASE  = "SuperSecretPassphrase!2024"   # must match clients
+MAX_CLIENTS        = 50
+BUFFER_SIZE        = 4096
+
+# ── shared state (protected by _lock) ────────────────────────────────────────
+_clients: dict[socket.socket, dict] = {}   # sock → {nick, cipher, addr}
+_lock = threading.Lock()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _send(sock: socket.socket, line: str) -> None:
+    """Send a protocol line to *sock*, ignoring broken-pipe errors."""
+    try:
+        sock.sendall(line.encode())
+    except OSError:
+        pass
+
+
+def _broadcast(sender_sock: socket.socket, sender_nick: str, plaintext: str) -> None:
+    """
+    Re-encrypt *plaintext* for each recipient using their own cipher and
+    send the message. Skip the original sender.
+    """
+    with _lock:
+        recipients = {s: info for s, info in _clients.items() if s is not sender_sock}
+
+    for sock, info in recipients.items():
+        try:
+            ct   = info["cipher_obj"].encrypt(plaintext)
+            line = encode_msg(sender_nick, ct)
+            _send(sock, line)
+        except Exception as exc:
+            log("SERVER", f"Broadcast error to {info['nick']}: {exc}")
+
+
+def _remove_client(sock: socket.socket) -> str:
+    """Remove *sock* from the client registry. Returns the nickname."""
+    with _lock:
+        info = _clients.pop(sock, {})
+    nick = info.get("nick", "unknown")
+    try:
+        sock.close()
+    except OSError:
+        pass
+    return nick
+
+
+# ── client handler ────────────────────────────────────────────────────────────
+
+def handle_client(sock: socket.socket, addr: tuple) -> None:
+    """Thread target: manage one connected client for its entire lifetime."""
+    log("CONNECT", f"New connection from {addr}")
+
+    # ── step 1: receive HELLO handshake ──────────────────────────────────────
+    try:
+        raw = sock.recv(BUFFER_SIZE).decode(errors="replace")
+    except OSError:
+        sock.close()
+        return
+
+    msg = decode(raw)
+    if msg["type"] != "HELLO":
+        log("SERVER", f"Bad handshake from {addr}: {raw!r}")
+        sock.close()
+        return
+
+    nickname    = msg["nickname"].strip() or f"user_{addr[1]}"
+    cipher_mode = msg.get("cipher", "AES").upper()
+
+    # build the cipher object for this client
+    try:
+        cipher_obj = get_cipher(cipher_mode, SHARED_PASSPHRASE)
+    except ValueError:
+        cipher_obj = get_cipher("AES", SHARED_PASSPHRASE)
+        cipher_mode = "AES"
+
+    # register the client
+    with _lock:
+        _clients[sock] = {
+            "nick":       nickname,
+            "cipher":     cipher_mode,
+            "cipher_obj": cipher_obj,
+            "addr":       addr,
+        }
+
+    _send(sock, encode_ack(nickname, cipher_mode))
+    log("HELLO", f"{nickname} joined using {cipher_mode} from {addr}")
+
+    # notify others
+    notice = cipher_obj.encrypt(f"*** {nickname} joined the chat ***")
+    _broadcast(sock, "SERVER", f"*** {nickname} joined the chat ***")
+    sys_line = encode_sys(f"{nickname} has joined.")
+    with _lock:
+        peers = [s for s in _clients if s is not sock]
+    for peer in peers:
+        _send(peer, sys_line)
+
+    # ── step 2: message loop ─────────────────────────────────────────────────
+    buf = ""
+    try:
+        while True:
+            data = sock.recv(BUFFER_SIZE)
+            if not data:
+                break
+            buf += data.decode(errors="replace")
+
+            # process complete lines
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+
+                parsed = decode(line)
+
+                if parsed["type"] == "MSG":
+                    encrypted = parsed["payload"]
+                    try:
+                        plaintext = cipher_obj.decrypt(encrypted)
+                    except Exception as exc:
+                        log("DECRYPT-ERR", f"From {nickname}: {exc}")
+                        continue
+
+                    # log both forms
+                    log("MSG", f"{nickname}: {plaintext}")
+                    log_raw("MSG-RAW", nickname, encrypted, plaintext)
+
+                    # broadcast (re-encrypted per recipient)
+                    _broadcast(sock, nickname, plaintext)
+
+                elif parsed["type"] == "BYE":
+                    log("BYE", f"{nickname} disconnected gracefully")
+                    raise StopIteration
+
+    except (OSError, StopIteration):
+        pass
+    finally:
+        nick = _remove_client(sock)
+        log("DISCONNECT", f"{nick} left the chat")
+        # notify others
+        _broadcast(sock, "SERVER", f"*** {nick} left the chat ***")
+        for peer_sock in list(_clients.keys()):
+            _send(peer_sock, encode_sys(f"{nick} has left."))
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Encrypted Chat Server")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    args = parser.parse_args()
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind((args.host, args.port))
+    server_sock.listen(MAX_CLIENTS)
+
+    log("SERVER", f"Listening on {args.host}:{args.port} (passphrase hash hidden)")
+    log("SERVER", "Supported ciphers: AES-256-CBC, 3DES-CBC")
+
+    try:
+        while True:
+            client_sock, client_addr = server_sock.accept()
+            t = threading.Thread(
+                target=handle_client,
+                args=(client_sock, client_addr),
+                daemon=True,
+            )
+            t.start()
+    except KeyboardInterrupt:
+        log("SERVER", "Shutting down.")
+    finally:
+        server_sock.close()
+
+
+if __name__ == "__main__":
+    main()
