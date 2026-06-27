@@ -1,0 +1,72 @@
+"""
+test_encryption.py
+==================
+Quick self-test for AES and DES encryption/decryption.
+Run from the project root:  python test_encryption.py
+"""
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from crypto.encryption import AESCipher, DESCipher, get_cipher
+
+PASSPHRASE = "SuperSecretPassphrase!2024"
+MESSAGES   = [
+    "Hello, World!",
+    "AES-256-CBC encryption test with a longer message 🔐",
+    "Short",
+    "A" * 200,   # long message
+]
+
+def test_cipher(label, cipher):
+    print(f"\n{'─'*60}")
+    print(f"  Testing {label}")
+    print(f"{'─'*60}")
+    all_pass = True
+    for msg in MESSAGES:
+        token     = cipher.encrypt(msg)
+        recovered = cipher.decrypt(token)
+        ok        = recovered == msg
+        status    = "✓ PASS" if ok else "✗ FAIL"
+        print(f"  {status}  plain={msg[:40]!r}")
+        if ok:
+            print(f"         encrypted={token[:60]}...")
+        else:
+            print(f"         got={recovered!r}")
+        all_pass = all_pass and ok
+
+    # IV uniqueness: two encryptions of the same plaintext must differ
+    t1 = cipher.encrypt("same message")
+    t2 = cipher.encrypt("same message")
+    iv_unique = t1 != t2
+    print(f"\n  {'✓' if iv_unique else '✗'} IV uniqueness: {'PASS — IVs differ each time' if iv_unique else 'FAIL — same ciphertext produced!'}")
+    return all_pass and iv_unique
+
+
+def main():
+    print("=" * 60)
+    print("  Encrypted Chat — Cipher Self-Test")
+    print("=" * 60)
+
+    results = []
+    results.append(("AES-256-CBC",  test_cipher("AES-256-CBC",  AESCipher(PASSPHRASE))))
+    results.append(("3DES-CBC",     test_cipher("3DES-CBC",     DESCipher(PASSPHRASE))))
+    results.append(("factory→AES",  test_cipher("factory→AES",  get_cipher("AES", PASSPHRASE))))
+    results.append(("factory→DES",  test_cipher("factory→DES",  get_cipher("DES", PASSPHRASE))))
+
+    print(f"\n{'='*60}")
+    print("  Summary")
+    print(f"{'='*60}")
+    for label, passed in results:
+        print(f"  {'✓' if passed else '✗'}  {label}")
+
+    if all(r for _, r in results):
+        print("\n  All tests passed! ✅\n")
+        sys.exit(0)
+    else:
+        print("\n  Some tests FAILED ❌\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
